@@ -12,6 +12,7 @@ Strategy:
 
 import hashlib
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 from telemetry import record_tokens, tracer
 from opentelemetry.trace import StatusCode
 
@@ -53,12 +54,14 @@ class RecursiveSummarizer:
     themselves are re-summarized when they exceed the budget.
     """
 
-    def __init__(self, chunk_size: int = 6, max_summary_tokens: int = 200):
+    def __init__(self, chunk_size: int = 6, max_summary_tokens: int = 200,
+                 llm_summarize_fn: Optional[Callable[[str], str]] = None):
         self.chunk_size = chunk_size
         self.max_summary_tokens = max_summary_tokens
         self.messages: list[Message] = []
         self.summaries: list[SummaryNode] = []
         self._total_saved: int = 0
+        self._llm_summarize_fn = llm_summarize_fn
 
     # ------------------------------------------------------------------
     # Public API
@@ -102,7 +105,20 @@ class RecursiveSummarizer:
             self.messages = self.messages[self.chunk_size:]
 
             source_tokens = sum(m.token_estimate for m in chunk)
-            summary_text = self._summarize_chunk(chunk)
+
+            # Use LLM summarizer if available, fall back to heuristic
+            if self._llm_summarize_fn:
+                try:
+                    chunk_text = "\n".join(f"[{m.role}] {m.content}" for m in chunk)
+                    summary_text = self._llm_summarize_fn(chunk_text)
+                    span.set_attribute("summarizer_mode", "llm")
+                except Exception:
+                    summary_text = self._summarize_chunk(chunk)
+                    span.set_attribute("summarizer_mode", "heuristic_fallback")
+            else:
+                summary_text = self._summarize_chunk(chunk)
+                span.set_attribute("summarizer_mode", "heuristic")
+
             compressed_tokens = max(1, len(summary_text) // 4)
             saved = source_tokens - compressed_tokens
 
@@ -133,7 +149,21 @@ class RecursiveSummarizer:
 
             combined = " | ".join(s.text for s in to_compress)
             source_tokens = sum(s.compressed_tokens for s in to_compress)
-            meta_summary = self._extract_key_points(combined)
+
+            # Use LLM for meta-compression if available
+            if self._llm_summarize_fn:
+                try:
+                    meta_summary = self._llm_summarize_fn(
+                        f"Condense these summaries into key points:\n{combined}"
+                    )
+                    span.set_attribute("summarizer_mode", "llm")
+                except Exception:
+                    meta_summary = self._extract_key_points(combined)
+                    span.set_attribute("summarizer_mode", "heuristic_fallback")
+            else:
+                meta_summary = self._extract_key_points(combined)
+                span.set_attribute("summarizer_mode", "heuristic")
+
             compressed_tokens = max(1, len(meta_summary) // 4)
             saved = source_tokens - compressed_tokens
 

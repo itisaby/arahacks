@@ -20,6 +20,7 @@ from app import (
 )
 from telemetry import trace_chat_turn, register_summarizer_metrics, shutdown_telemetry
 from dashboard import DashboardHandler
+from comparison import ComparisonHandler
 from http.server import HTTPServer
 
 # Register summarizer for observable gauge metrics
@@ -107,8 +108,14 @@ if __name__ == "__main__":
 
     print(f"\n{'='*50}")
     print("Starting dashboard on http://localhost:8050")
+    print("Starting comparison UI on http://localhost:8060")
     print("Grafana dashboard at http://localhost:3000")
     print("Press Ctrl+C to stop")
     print(f"{'='*50}\n")
+
+    # Start comparison UI on :8060 in a background thread
+    comparison_server = HTTPServer(("", 8060), ComparisonHandler)
+    comparison_thread = threading.Thread(target=comparison_server.serve_forever, daemon=True)
+    comparison_thread.start()
 
     HTTPServer(("", 8050), DashboardHandler).serve_forever()

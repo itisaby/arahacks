@@ -12,6 +12,7 @@ import json
 import socket
 import logging
 import functools
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from opentelemetry import trace, metrics
@@ -196,19 +197,115 @@ def _record_span(name: str, attrs: dict, duration_ms: float):
 _token_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "saved_tokens": 0}
 
 
-def record_tokens(prompt: int, completion: int, saved: int = 0):
+def record_tokens(prompt: int, completion: int, saved: int = 0, mode: str = ""):
     _token_usage["prompt_tokens"] += prompt
     _token_usage["completion_tokens"] += completion
     _token_usage["saved_tokens"] += saved
-    # Emit OTel counter metrics
-    _prompt_token_counter.add(prompt)
-    _completion_token_counter.add(completion)
+    # Emit OTel counter metrics with optional mode attribute
+    attrs = {"mode": mode} if mode else {}
+    _prompt_token_counter.add(prompt, attrs)
+    _completion_token_counter.add(completion, attrs)
     if saved > 0:
-        _saved_token_counter.add(saved)
+        _saved_token_counter.add(saved, attrs)
 
 
 def get_token_usage() -> dict:
     return dict(_token_usage)
+
+
+# ---------------------------------------------------------------------------
+# Immutable cost tracking — audit trail of every API call
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class CostRecord:
+    """Immutable record of a single API call's cost."""
+    timestamp: str
+    mode: str               # "optimized", "baseline", "summarizer"
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    input_cost: float
+    output_cost: float
+    total_cost: float
+
+
+@dataclass(frozen=True, slots=True)
+class CostTracker:
+    """Immutable, append-only cost ledger. Each mutation returns a new instance."""
+    budget_limit: float = 5.00  # $ safety cap per session
+    records: tuple[CostRecord, ...] = ()
+
+    def add(self, record: CostRecord) -> "CostTracker":
+        return CostTracker(budget_limit=self.budget_limit,
+                           records=(*self.records, record))
+
+    @property
+    def total_cost(self) -> float:
+        return sum(r.total_cost for r in self.records)
+
+    @property
+    def budget_remaining(self) -> float:
+        return max(0, self.budget_limit - self.total_cost)
+
+    @property
+    def is_over_budget(self) -> bool:
+        return self.total_cost >= self.budget_limit
+
+    def by_mode(self, mode: str) -> tuple[CostRecord, ...]:
+        return tuple(r for r in self.records if r.mode == mode)
+
+    def summary(self) -> dict:
+        return {
+            "total_cost": round(self.total_cost, 6),
+            "budget_limit": self.budget_limit,
+            "budget_remaining": round(self.budget_remaining, 6),
+            "budget_pct_used": round(self.total_cost / self.budget_limit * 100, 1) if self.budget_limit > 0 else 0,
+            "total_records": len(self.records),
+            "cost_by_mode": {
+                mode: round(sum(r.total_cost for r in self.by_mode(mode)), 6)
+                for mode in set(r.mode for r in self.records)
+            },
+        }
+
+
+# Global cost tracker instance
+_cost_tracker = CostTracker()
+
+
+def record_cost(mode: str, model: str, input_tokens: int, output_tokens: int,
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                cost_per_input: float = 3.0 / 1_000_000,
+                cost_per_output: float = 15.0 / 1_000_000) -> CostRecord:
+    """Record an API call's cost immutably. Returns the CostRecord."""
+    global _cost_tracker
+    input_cost = input_tokens * cost_per_input
+    output_cost = output_tokens * cost_per_output
+    record = CostRecord(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        mode=mode,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        input_cost=round(input_cost, 8),
+        output_cost=round(output_cost, 8),
+        total_cost=round(input_cost + output_cost, 8),
+    )
+    _cost_tracker = _cost_tracker.add(record)
+    return record
+
+
+def get_cost_tracker() -> CostTracker:
+    return _cost_tracker
+
+
+def reset_cost_tracker(budget_limit: float = 5.00):
+    global _cost_tracker
+    _cost_tracker = CostTracker(budget_limit=budget_limit)
 
 
 # ---------------------------------------------------------------------------

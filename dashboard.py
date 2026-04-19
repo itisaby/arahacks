@@ -90,6 +90,12 @@ def _build_html() -> str:
     font-weight: bold; font-family: inherit;
   }}
   .refresh-btn:hover {{ background: #00b8e0; }}
+  .grafana-btn {{
+    position: fixed; bottom: 24px; right: 160px; background: #ff6600; color: #fff;
+    border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer;
+    font-weight: bold; font-family: inherit; text-decoration: none;
+  }}
+  .grafana-btn:hover {{ background: #e55b00; }}
 </style>
 </head>
 <body>
@@ -147,6 +153,7 @@ def _build_html() -> str:
     <div id="chart"></div>
   </div>
 
+  <a href="http://localhost:3000/d/araflow-overview" target="_blank" class="grafana-btn">Open Grafana Dashboard</a>
   <button class="refresh-btn" onclick="location.reload()">Refresh</button>
 
   <script>
