@@ -12,11 +12,13 @@ import os
 import json
 import time
 import threading
+import urllib.request
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 from recursive_summarizer import RecursiveSummarizer
-from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer, register_summarizer_metrics
+from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer, register_summarizer_metrics, traced_tool
 from council import run_live_council, _MODEL_PRICING
 
 # ---------------------------------------------------------------------------
@@ -28,131 +30,245 @@ COST_PER_OUTPUT_TOKEN = 15.0 / 1_000_000  # $15.00 per 1M output tokens
 MODEL = os.environ.get("ARAFLOW_MODEL", "claude-sonnet-4-20250514")
 MODEL_CHEAP = os.environ.get("ARAFLOW_MODEL_CHEAP", "claude-haiku-4-5-20251001")
 USE_LLM_SUMMARIZER = os.environ.get("ARAFLOW_LLM_SUMMARIZER", "1") == "1"
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
 
 # ---------------------------------------------------------------------------
-# Web search tool (DuckDuckGo instant answer API — no key needed)
+# GitHub API tools (direct REST API via GH_TOKEN)
 # ---------------------------------------------------------------------------
-WEB_SEARCH_TOOL = {
-    "name": "web_search",
-    "description": "Search the web for current information. Use this when the user asks about recent events, news, current data, or anything that might need up-to-date information.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query to look up on the web.",
-            }
-        },
-        "required": ["query"],
-    },
-}
+
+def _gh_api(endpoint: str) -> dict | list:
+    """Call GitHub REST API. Returns parsed JSON."""
+    url = "https://api.github.com" + endpoint
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "AraFlow/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
 
 
 @traced_tool
-def web_search(query: str) -> dict:
-    """Search DuckDuckGo instant answer API and return results."""
-    url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
-        "q": query, "format": "json", "no_html": "1", "skip_disambig": "1",
-    })
-    req = urllib.request.Request(url, headers={"User-Agent": "AraFlow/1.0"})
+def github_list_repos(username: str = "", per_page: int = 10) -> dict:
+    """List repositories for the authenticated user or a given username."""
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+        if username:
+            data = _gh_api(f"/users/{urllib.parse.quote(username)}/repos?per_page={per_page}&sort=updated")
+        else:
+            data = _gh_api(f"/user/repos?per_page={per_page}&sort=updated&affiliation=owner")
+        repos = [{"name": r["full_name"], "description": r.get("description") or "",
+                   "language": r.get("language") or "", "stars": r["stargazers_count"],
+                   "updated": r["updated_at"], "url": r["html_url"],
+                   "private": r["private"]} for r in data]
+        return {"repos": repos, "count": len(repos)}
     except Exception as e:
-        return {"query": query, "results": [], "error": str(e)}
-
-    results = []
-    # Abstract (main answer)
-    if data.get("Abstract"):
-        results.append({
-            "title": data.get("Heading", ""),
-            "snippet": data["Abstract"],
-            "url": data.get("AbstractURL", ""),
-        })
-    # Related topics
-    for topic in (data.get("RelatedTopics") or [])[:5]:
-        if isinstance(topic, dict) and topic.get("Text"):
-            results.append({
-                "title": topic.get("Text", "")[:80],
-                "snippet": topic.get("Text", ""),
-                "url": topic.get("FirstURL", ""),
-            })
-    # If no results from instant answer, provide a fallback
-    if not results:
-        results.append({
-            "title": f"Web search: {query}",
-            "snippet": f"DuckDuckGo did not return an instant answer for '{query}'. The query was executed but no structured results were available. Try answering based on your knowledge.",
-            "url": f"https://duckduckgo.com/?q={urllib.parse.quote(query)}",
-        })
-
-    return {"query": query, "results": results}
+        return {"error": str(e), "repos": []}
 
 
-MAX_TOOL_ROUNDS = 3  # prevent infinite tool-use loops
+@traced_tool
+def github_get_repo(owner: str, repo: str) -> dict:
+    """Get detailed info about a specific repository."""
+    try:
+        r = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}")
+        return {"name": r["full_name"], "description": r.get("description") or "",
+                "language": r.get("language") or "", "stars": r["stargazers_count"],
+                "forks": r["forks_count"], "open_issues": r["open_issues_count"],
+                "default_branch": r["default_branch"], "url": r["html_url"],
+                "private": r["private"], "created": r["created_at"],
+                "updated": r["updated_at"], "topics": r.get("topics", [])}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def _run_tool_use_loop(client, model, system, messages, tools):
-    """Run Claude with tools, handling tool_use blocks in a loop.
+@traced_tool
+def github_list_issues(owner: str, repo: str, state: str = "open", per_page: int = 10) -> dict:
+    """List issues for a repository."""
+    try:
+        data = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/issues?state={state}&per_page={per_page}")
+        issues = [{"number": i["number"], "title": i["title"], "state": i["state"],
+                    "user": i["user"]["login"], "created": i["created_at"],
+                    "labels": [l["name"] for l in i.get("labels", [])],
+                    "url": i["html_url"]} for i in data if "pull_request" not in i]
+        return {"issues": issues, "count": len(issues)}
+    except Exception as e:
+        return {"error": str(e), "issues": []}
 
-    Returns (reply_text, total_input_tokens, total_output_tokens, tool_calls_made).
+
+@traced_tool
+def github_list_pull_requests(owner: str, repo: str, state: str = "open", per_page: int = 10) -> dict:
+    """List pull requests for a repository."""
+    try:
+        data = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls?state={state}&per_page={per_page}")
+        prs = [{"number": p["number"], "title": p["title"], "state": p["state"],
+                "user": p["user"]["login"], "created": p["created_at"],
+                "head": p["head"]["ref"], "base": p["base"]["ref"],
+                "url": p["html_url"]} for p in data]
+        return {"pull_requests": prs, "count": len(prs)}
+    except Exception as e:
+        return {"error": str(e), "pull_requests": []}
+
+
+@traced_tool
+def github_get_notifications(per_page: int = 10) -> dict:
+    """Get the authenticated user's unread notifications."""
+    try:
+        data = _gh_api(f"/notifications?per_page={per_page}")
+        notifs = [{"id": n["id"], "reason": n["reason"],
+                   "title": n["subject"]["title"], "type": n["subject"]["type"],
+                   "repo": n["repository"]["full_name"],
+                   "updated": n["updated_at"]} for n in data]
+        return {"notifications": notifs, "count": len(notifs)}
+    except Exception as e:
+        return {"error": str(e), "notifications": []}
+
+
+# Tool schemas for Claude
+GITHUB_TOOLS = [
+    {
+        "name": "github_list_repos",
+        "description": "List GitHub repositories for the authenticated user or a specific username. Returns repo names, descriptions, languages, stars, and URLs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "GitHub username. Leave empty to list the authenticated user's own repos."},
+                "per_page": {"type": "integer", "description": "Number of repos to return (default 10, max 100)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "github_get_repo",
+        "description": "Get detailed information about a specific GitHub repository including stars, forks, open issues, topics, and more.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner (username or org)."},
+                "repo": {"type": "string", "description": "Repository name."},
+            },
+            "required": ["owner", "repo"],
+        },
+    },
+    {
+        "name": "github_list_issues",
+        "description": "List issues for a GitHub repository. Can filter by state (open/closed/all).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner."},
+                "repo": {"type": "string", "description": "Repository name."},
+                "state": {"type": "string", "description": "Filter by state: open, closed, or all (default: open)."},
+                "per_page": {"type": "integer", "description": "Number of issues to return (default 10)."},
+            },
+            "required": ["owner", "repo"],
+        },
+    },
+    {
+        "name": "github_list_pull_requests",
+        "description": "List pull requests for a GitHub repository. Can filter by state (open/closed/all).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner."},
+                "repo": {"type": "string", "description": "Repository name."},
+                "state": {"type": "string", "description": "Filter by state: open, closed, or all (default: open)."},
+                "per_page": {"type": "integer", "description": "Number of PRs to return (default 10)."},
+            },
+            "required": ["owner", "repo"],
+        },
+    },
+    {
+        "name": "github_get_notifications",
+        "description": "Get the authenticated user's unread GitHub notifications.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "per_page": {"type": "integer", "description": "Number of notifications to return (default 10)."},
+            },
+            "required": [],
+        },
+    },
+]
+
+# Map tool names to handler functions
+_TOOL_HANDLERS = {
+    "github_list_repos": lambda args: github_list_repos(username=args.get("username", ""), per_page=args.get("per_page", 10)),
+    "github_get_repo": lambda args: github_get_repo(owner=args["owner"], repo=args["repo"]),
+    "github_list_issues": lambda args: github_list_issues(owner=args["owner"], repo=args["repo"], state=args.get("state", "open"), per_page=args.get("per_page", 10)),
+    "github_list_pull_requests": lambda args: github_list_pull_requests(owner=args["owner"], repo=args["repo"], state=args.get("state", "open"), per_page=args.get("per_page", 10)),
+    "github_get_notifications": lambda args: github_get_notifications(per_page=args.get("per_page", 10)),
+}
+
+MAX_TOOL_ROUNDS = 3
+
+
+def _run_tool_use_loop(client, model, system, messages):
+    """Run Claude with GitHub tools, handling tool_use blocks in a loop.
+
+    Returns (reply_text, total_input_tokens, total_output_tokens, tool_calls_made, cache_read, cache_creation).
     """
     total_input = 0
     total_output = 0
     tool_calls_made = 0
     current_messages = list(messages)
 
+    # Only offer tools if GH_TOKEN is available
+    tools = GITHUB_TOOLS if GH_TOKEN else []
+
     for _round in range(MAX_TOOL_ROUNDS + 1):
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=system,
-            messages=current_messages,
-            tools=tools,
-        )
+        create_kwargs = dict(model=model, max_tokens=1024, system=system, messages=current_messages)
+        if tools:
+            create_kwargs["tools"] = tools
+        response = client.messages.create(**create_kwargs)
 
         total_input += response.usage.input_tokens
         total_output += response.usage.output_tokens
 
-        # Check if Claude wants to use a tool
+        # Check for tool use
         tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
         text_blocks = [b for b in response.content if b.type == "text"]
 
         if not tool_use_blocks or _round >= MAX_TOOL_ROUNDS:
-            # No tool calls or max rounds reached — extract final text
             reply = text_blocks[0].text if text_blocks else ""
-            # Extract cache metrics from last response
             usage = response.usage
             cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
             cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
             return reply, total_input, total_output, tool_calls_made, cache_read, cache_creation
 
-        # Execute tool calls
-        # Build assistant message with all content blocks
+        # Execute tool calls and continue the loop
         current_messages.append({"role": "assistant", "content": response.content})
 
-        # Process each tool_use block
         tool_results = []
-        for tool_block in tool_use_blocks:
+        for block in tool_use_blocks:
             tool_calls_made += 1
-            if tool_block.name == "web_search":
-                result = web_search(query=tool_block.input.get("query", ""))
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": json.dumps(result),
-                })
+            handler = _TOOL_HANDLERS.get(block.name)
+            if handler:
+                result = handler(block.input)
             else:
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": json.dumps({"error": f"Unknown tool: {tool_block.name}"}),
-                    "is_error": True,
-                })
+                result = {"error": f"Unknown tool: {block.name}"}
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(result),
+            })
 
         current_messages.append({"role": "user", "content": tool_results})
 
-    # Fallback (shouldn't reach here)
     return "", total_input, total_output, tool_calls_made, 0, 0
+
+
+SYSTEM_PROMPT = "You are a helpful assistant. Be concise."
+SYSTEM_PROMPT_WITH_TOOLS = """You are a helpful assistant with access to the user's GitHub account. Be concise.
+
+You can use GitHub tools to look up repositories, issues, pull requests, and notifications.
+When the user asks about their GitHub repos, PRs, issues, or activity, use the tools to fetch live data.
+Do NOT make up repository names or data — always use the tools to get real information."""
+
+
+def _get_system_prompt():
+    """Return the appropriate system prompt based on whether GH_TOKEN is set."""
+    text = SYSTEM_PROMPT_WITH_TOOLS if GH_TOKEN else SYSTEM_PROMPT
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
 # ---------------------------------------------------------------------------
@@ -231,33 +347,21 @@ def _call_optimized(user_message: str) -> dict:
             merged.append(dict(msg))
 
     client = _get_client()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=[{
-            "type": "text",
-            "text": "You are a helpful assistant. Be concise.",
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=merged,
+    reply, input_tokens, output_tokens, tool_calls, cache_read, cache_creation = _run_tool_use_loop(
+        client, MODEL, _get_system_prompt(), merged,
     )
 
-    reply = response.content[0].text
     _summarizer.add_message("assistant", reply)
-
-    # Extract cache metrics if available
-    usage = response.usage
-    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
 
     stats = _summarizer.get_stats()
 
     return {
         "reply": reply,
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "cache_read_tokens": cache_read,
         "cache_creation_tokens": cache_creation,
+        "tool_calls_made": tool_calls,
         "pipeline": {
             "summary_nodes": len(summary_messages),
             "raw_messages": len(raw_messages),
@@ -273,30 +377,19 @@ def _call_baseline(user_message: str) -> dict:
     _baseline_history.append({"role": "user", "content": user_message})
 
     client = _get_client()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=[{
-            "type": "text",
-            "text": "You are a helpful assistant. Be concise.",
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=list(_baseline_history),
+    reply, input_tokens, output_tokens, tool_calls, cache_read, cache_creation = _run_tool_use_loop(
+        client, MODEL, _get_system_prompt(), list(_baseline_history),
     )
 
-    reply = response.content[0].text
     _baseline_history.append({"role": "assistant", "content": reply})
-
-    usage = response.usage
-    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
 
     return {
         "reply": reply,
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "cache_read_tokens": cache_read,
         "cache_creation_tokens": cache_creation,
+        "tool_calls_made": tool_calls,
         "pipeline": {
             "total_messages": len(_baseline_history),
         },
@@ -1270,7 +1363,7 @@ function calcCost(inputTok, outputTok) {{
   return (inputTok * SONNET_INPUT + outputTok * SONNET_OUTPUT);
 }}
 
-function addMsg(container, role, text, tokens, cost) {{
+function addMsg(container, role, text, tokens, cost, toolCalls) {{
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   div.textContent = text;
@@ -1280,6 +1373,9 @@ function addMsg(container, role, text, tokens, cost) {{
     let label = tokens + ' tok';
     if (cost !== undefined) {{
       label += ' · $' + cost.toFixed(4);
+    }}
+    if (toolCalls && toolCalls > 0) {{
+      label += ' · GH:' + toolCalls;
     }}
     badge.textContent = label;
     div.appendChild(badge);
@@ -1458,7 +1554,7 @@ async function sendPaneMessage(pane) {{
       const result = data[dataKey];
       const tok = result.input_tokens + result.output_tokens;
       const cost = calcCost(result.input_tokens, result.output_tokens);
-      addMsg(msgContainer, 'assistant', result.reply, tok, cost);
+      addMsg(msgContainer, 'assistant', result.reply, tok, cost, result.tool_calls_made || 0);
     }}
 
     // Update pipeline viz for this pane
@@ -1596,8 +1692,8 @@ async function sendSharedMessage(msg) {{
   const optCost = calcCost(data.optimized.input_tokens, data.optimized.output_tokens);
   const baseCost = calcCost(data.baseline.input_tokens, data.baseline.output_tokens);
 
-  addMsg(optMessages, 'assistant', data.optimized.reply, optTok, optCost);
-  addMsg(baseMessages, 'assistant', data.baseline.reply, baseTok, baseCost);
+  addMsg(optMessages, 'assistant', data.optimized.reply, optTok, optCost, data.optimized.tool_calls_made || 0);
+  addMsg(baseMessages, 'assistant', data.baseline.reply, baseTok, baseCost, data.baseline.tool_calls_made || 0);
 
   // Update pipelines
   updateOptPipeline(data.optimized.pipeline);

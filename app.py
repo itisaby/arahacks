@@ -278,6 +278,12 @@ Your capabilities:
   role-play each persona in order, staying in character for each one.
   After all rounds, The Synthesizer delivers a final verdict with concrete
   next steps. Format the debate clearly with headers and persona labels.
+- **GitHub Integration**: You can access the user's GitHub repositories,
+  issues, pull requests, and notifications via the connected GitHub account.
+  Use this to check repo status, review PRs, or summarize recent activity.
+- **Messages Integration**: You can read and send messages via the connected
+  messaging account. Use this to check unread messages, send replies, or
+  summarize conversations.
 
 Behavior guidelines:
 - Be concise and action-oriented
@@ -287,6 +293,8 @@ Behavior guidelines:
   help them understand and optimize their process
 - When the user says "council", "debate", "deep discussion", or "multiple
   perspectives", automatically invoke the LLM Council
+- When the user asks about their GitHub repos, PRs, issues, or messages,
+  use the connected integrations to fetch live data
 """,
     tools=[
         add_task,
@@ -302,5 +310,9 @@ Behavior guidelines:
         start_council,
         list_council_personas,
         get_council_history,
+    ],
+    skills=[
+        ara.connectors.github,
+        ara.connectors.messages,
     ],
 )
