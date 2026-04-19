@@ -12,13 +12,11 @@ import os
 import json
 import time
 import threading
-import urllib.request
-import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 from recursive_summarizer import RecursiveSummarizer
-from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer, register_summarizer_metrics, traced_tool
+from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer, register_summarizer_metrics
 from council import run_live_council, _MODEL_PRICING
 
 # ---------------------------------------------------------------------------
