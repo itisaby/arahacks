@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Remote write receiver is enabled via --web.enable-remote-write-receiver flag
+# in docker-compose.yml, so OTel collector and Tempo can push metrics here.
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
