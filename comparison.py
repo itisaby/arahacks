@@ -12,11 +12,14 @@ import os
 import json
 import time
 import threading
+import urllib.request
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 from recursive_summarizer import RecursiveSummarizer
-from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer
+from telemetry import record_tokens, record_cost, get_cost_tracker, reset_cost_tracker, tracer, register_summarizer_metrics, traced_tool
+from council import run_live_council, _MODEL_PRICING
 
 # ---------------------------------------------------------------------------
 # Claude API pricing (Sonnet per-token costs as of 2025)
@@ -27,6 +30,132 @@ COST_PER_OUTPUT_TOKEN = 15.0 / 1_000_000  # $15.00 per 1M output tokens
 MODEL = os.environ.get("ARAFLOW_MODEL", "claude-sonnet-4-20250514")
 MODEL_CHEAP = os.environ.get("ARAFLOW_MODEL_CHEAP", "claude-haiku-4-5-20251001")
 USE_LLM_SUMMARIZER = os.environ.get("ARAFLOW_LLM_SUMMARIZER", "1") == "1"
+
+# ---------------------------------------------------------------------------
+# Web search tool (DuckDuckGo instant answer API — no key needed)
+# ---------------------------------------------------------------------------
+WEB_SEARCH_TOOL = {
+    "name": "web_search",
+    "description": "Search the web for current information. Use this when the user asks about recent events, news, current data, or anything that might need up-to-date information.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query to look up on the web.",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+
+@traced_tool
+def web_search(query: str) -> dict:
+    """Search DuckDuckGo instant answer API and return results."""
+    url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+        "q": query, "format": "json", "no_html": "1", "skip_disambig": "1",
+    })
+    req = urllib.request.Request(url, headers={"User-Agent": "AraFlow/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        return {"query": query, "results": [], "error": str(e)}
+
+    results = []
+    # Abstract (main answer)
+    if data.get("Abstract"):
+        results.append({
+            "title": data.get("Heading", ""),
+            "snippet": data["Abstract"],
+            "url": data.get("AbstractURL", ""),
+        })
+    # Related topics
+    for topic in (data.get("RelatedTopics") or [])[:5]:
+        if isinstance(topic, dict) and topic.get("Text"):
+            results.append({
+                "title": topic.get("Text", "")[:80],
+                "snippet": topic.get("Text", ""),
+                "url": topic.get("FirstURL", ""),
+            })
+    # If no results from instant answer, provide a fallback
+    if not results:
+        results.append({
+            "title": f"Web search: {query}",
+            "snippet": f"DuckDuckGo did not return an instant answer for '{query}'. The query was executed but no structured results were available. Try answering based on your knowledge.",
+            "url": f"https://duckduckgo.com/?q={urllib.parse.quote(query)}",
+        })
+
+    return {"query": query, "results": results}
+
+
+MAX_TOOL_ROUNDS = 3  # prevent infinite tool-use loops
+
+
+def _run_tool_use_loop(client, model, system, messages, tools):
+    """Run Claude with tools, handling tool_use blocks in a loop.
+
+    Returns (reply_text, total_input_tokens, total_output_tokens, tool_calls_made).
+    """
+    total_input = 0
+    total_output = 0
+    tool_calls_made = 0
+    current_messages = list(messages)
+
+    for _round in range(MAX_TOOL_ROUNDS + 1):
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=system,
+            messages=current_messages,
+            tools=tools,
+        )
+
+        total_input += response.usage.input_tokens
+        total_output += response.usage.output_tokens
+
+        # Check if Claude wants to use a tool
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        text_blocks = [b for b in response.content if b.type == "text"]
+
+        if not tool_use_blocks or _round >= MAX_TOOL_ROUNDS:
+            # No tool calls or max rounds reached — extract final text
+            reply = text_blocks[0].text if text_blocks else ""
+            # Extract cache metrics from last response
+            usage = response.usage
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            return reply, total_input, total_output, tool_calls_made, cache_read, cache_creation
+
+        # Execute tool calls
+        # Build assistant message with all content blocks
+        current_messages.append({"role": "assistant", "content": response.content})
+
+        # Process each tool_use block
+        tool_results = []
+        for tool_block in tool_use_blocks:
+            tool_calls_made += 1
+            if tool_block.name == "web_search":
+                result = web_search(query=tool_block.input.get("query", ""))
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": json.dumps(result),
+                })
+            else:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": json.dumps({"error": f"Unknown tool: {tool_block.name}"}),
+                    "is_error": True,
+                })
+
+        current_messages.append({"role": "user", "content": tool_results})
+
+    # Fallback (shouldn't reach here)
+    return "", total_input, total_output, tool_calls_made, 0, 0
+
 
 # ---------------------------------------------------------------------------
 # LLM-powered summarizer function (uses cheap model)
@@ -52,9 +181,10 @@ def _llm_summarize(text: str) -> str:
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _summarizer = RecursiveSummarizer(
-    chunk_size=6, max_summary_tokens=200,
+    chunk_size=2, max_summary_tokens=200,
     llm_summarize_fn=_llm_summarize if USE_LLM_SUMMARIZER else None,
 )
+register_summarizer_metrics(_summarizer)
 _baseline_history: list[dict] = []
 _cumulative = {
     "optimized_input": 0,
@@ -287,6 +417,92 @@ def _handle_solo_baseline(message: str) -> dict:
     return {"baseline": baseline}
 
 
+def _handle_council(message: str) -> dict:
+    """Run the 3-persona council and return results."""
+    with tracer.start_as_current_span("comparison.council") as span:
+        span.set_attribute("message", message[:200])
+
+        client = _get_client()
+
+        # Feed through summarizer for context compression (same as optimized path)
+        _summarizer.add_message("user", message)
+        context = _summarizer.get_context()
+        # Build history from compressed context (excluding latest user msg which council will add)
+        history = []
+        for m in context:
+            role = m["role"] if m["role"] != "system" else "user"
+            history.append({"role": role, "content": m["content"]})
+        # Merge consecutive same-role messages
+        merged_history = []
+        for msg in history:
+            if merged_history and merged_history[-1]["role"] == msg["role"]:
+                merged_history[-1]["content"] += "\n" + msg["content"]
+            else:
+                merged_history.append(dict(msg))
+        # Remove last user message (the current one) since council will add it
+        if merged_history and merged_history[-1]["role"] == "user":
+            last_content = merged_history[-1]["content"]
+            if last_content.endswith(message):
+                if len(last_content) == len(message):
+                    merged_history.pop()
+                else:
+                    merged_history[-1]["content"] = last_content[:-(len(message))].rstrip("\n")
+
+        result = run_live_council(client, message, merged_history)
+
+    # Add synthesizer's reply to summarizer history
+    _summarizer.add_message("assistant", result["final_reply"])
+
+    # Record cost per persona call
+    for rnd in result["council_rounds"]:
+        pricing = _MODEL_PRICING.get(
+            "claude-haiku-4-5-20251001" if rnd["model"] == "haiku" else "claude-sonnet-4-20250514",
+            _MODEL_PRICING["claude-sonnet-4-20250514"]
+        )
+        record_cost(
+            "council", rnd["model"], rnd["input_tokens"], rnd["output_tokens"],
+            cost_per_input=pricing["cost_per_input"],
+            cost_per_output=pricing["cost_per_output"],
+        )
+
+    record_tokens(result["total_input_tokens"], result["total_output_tokens"], mode="optimized")
+
+    # Track in cumulative under optimized keys so savings bar still works
+    with _lock:
+        _cumulative["optimized_input"] += result["total_input_tokens"]
+        _cumulative["optimized_output"] += result["total_output_tokens"]
+        _cumulative["turns"] += 1
+
+        _turn_history.append({
+            "turn": _cumulative["turns"],
+            "optimized_input": result["total_input_tokens"],
+            "baseline_input": 0,
+            "cum_optimized": _cumulative["optimized_input"] + _cumulative["optimized_output"],
+            "cum_baseline": _cumulative["baseline_input"] + _cumulative["baseline_output"],
+        })
+
+    # Build pipeline info
+    summary_messages = [m for m in context if m["content"].startswith("[Summary L")]
+    raw_messages = [m for m in context if not m["content"].startswith("[Summary L")]
+    stats = _summarizer.get_stats()
+
+    return {
+        "council": result,
+        "optimized": {
+            "reply": result["final_reply"],
+            "input_tokens": result["total_input_tokens"],
+            "output_tokens": result["total_output_tokens"],
+            "pipeline": {
+                "summary_nodes": len(summary_messages),
+                "raw_messages": len(raw_messages),
+                "total_context_items": len(context),
+                "summarizer_stats": stats,
+                "summaries_preview": [m["content"][:120] for m in summary_messages],
+            },
+        },
+    }
+
+
 def _get_stats() -> dict:
     with _lock:
         c = dict(_cumulative)
@@ -378,9 +594,10 @@ def _reset():
     global _summarizer, _baseline_history
     with _lock:
         _summarizer = RecursiveSummarizer(
-            chunk_size=6, max_summary_tokens=200,
+            chunk_size=2, max_summary_tokens=200,
             llm_summarize_fn=_llm_summarize if USE_LLM_SUMMARIZER else None,
         )
+        register_summarizer_metrics(_summarizer)
         _baseline_history.clear()
         _turn_history.clear()
         for k in _cumulative:
@@ -855,6 +1072,78 @@ body {{
   padding: 24px;
   font-size: 12px;
 }}
+
+/* Council toggle */
+.council-btn {{
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #2a2a3e;
+  background: #1e1e2e;
+  color: #888;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: bold;
+  cursor: pointer;
+  flex-shrink: 0;
+  height: 38px;
+  transition: all 0.2s;
+}}
+.council-btn:hover {{ border-color: #00d4ff; color: #00d4ff; }}
+.council-btn.active {{
+  background: #003344;
+  color: #00d4ff;
+  border-color: #00d4ff;
+}}
+
+/* Council debate collapsible */
+.council-debate {{
+  margin-top: 10px;
+  border: 1px solid #1e1e2e;
+  border-radius: 8px;
+  overflow: hidden;
+}}
+.council-debate-toggle {{
+  padding: 6px 12px;
+  background: #0d0d14;
+  cursor: pointer;
+  font-size: 11px;
+  color: #00d4ff;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}}
+.council-debate-toggle:hover {{ background: #111118; }}
+.council-debate-body {{
+  display: none;
+  padding: 0;
+}}
+.council-debate-body.open {{ display: block; }}
+.council-persona {{
+  padding: 10px 12px;
+  border-top: 1px solid #1e1e2e;
+  font-size: 12px;
+  line-height: 1.5;
+}}
+.council-persona-header {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: bold;
+}}
+.council-persona-header .model-badge {{
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: normal;
+}}
+.model-badge.haiku {{ background: #1a2a1a; color: #88cc88; }}
+.model-badge.sonnet {{ background: #1a1a2a; color: #8888ff; }}
+.council-persona-text {{
+  color: #ccc;
+  white-space: pre-wrap;
+}}
 </style>
 </head>
 <body>
@@ -921,6 +1210,7 @@ body {{
       <textarea id="opt-input" rows="1" placeholder="Type a message or upload PDF..."
                 onkeydown="handlePaneKey(event, 'opt')"
                 oninput="autoGrow(this)"></textarea>
+      <button class="council-btn" id="council-toggle" onclick="toggleCouncil()" title="Toggle Council mode (3-model debate)">Council</button>
       <button class="send-btn" id="opt-send" onclick="sendPaneMessage('opt')">Send</button>
       <input type="file" id="opt-file" accept=".pdf" style="display:none" onchange="handlePdf(event, 'opt')">
     </div>
@@ -974,14 +1264,26 @@ function handlePaneKey(e, pane) {{
   }}
 }}
 
-function addMsg(container, role, text, tokens) {{
+// Sonnet pricing for cost display
+const SONNET_INPUT = 3.0 / 1_000_000;
+const SONNET_OUTPUT = 15.0 / 1_000_000;
+
+function calcCost(inputTok, outputTok) {{
+  return (inputTok * SONNET_INPUT + outputTok * SONNET_OUTPUT);
+}}
+
+function addMsg(container, role, text, tokens, cost) {{
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   div.textContent = text;
   if (tokens !== undefined) {{
     const badge = document.createElement('span');
     badge.className = 'token-badge';
-    badge.textContent = tokens + ' tok';
+    let label = tokens + ' tok';
+    if (cost !== undefined) {{
+      label += ' · $' + cost.toFixed(4);
+    }}
+    badge.textContent = label;
     div.appendChild(badge);
   }}
   container.appendChild(div);
@@ -1000,6 +1302,88 @@ function addSpinner(container) {{
 function removeSpinner(container) {{
   const el = document.getElementById(container.id + '-spinner');
   if (el) el.remove();
+}}
+
+// --- Council toggle ---
+let councilMode = false;
+
+function toggleCouncil() {{
+  councilMode = !councilMode;
+  const btn = document.getElementById('council-toggle');
+  const textarea = document.getElementById('opt-input');
+  if (councilMode) {{
+    btn.classList.add('active');
+    btn.textContent = 'Council ON';
+    textarea.placeholder = 'Council mode — 3 models will debate your prompt...';
+  }} else {{
+    btn.classList.remove('active');
+    btn.textContent = 'Council';
+    textarea.placeholder = 'Type a message or upload PDF...';
+  }}
+}}
+
+function addCouncilMsg(container, data) {{
+  const council = data.council;
+  const tok = council.total_input_tokens + council.total_output_tokens;
+
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.style.maxWidth = '95%';
+
+  // Main reply (synthesizer output)
+  const replyText = document.createElement('div');
+  replyText.textContent = council.final_reply;
+  div.appendChild(replyText);
+
+  // Token badge
+  const badge = document.createElement('span');
+  badge.className = 'token-badge';
+  badge.textContent = tok + ' tok';
+  div.appendChild(badge);
+
+  // Collapsible council debate
+  const debate = document.createElement('div');
+  debate.className = 'council-debate';
+
+  const roundSummary = council.council_rounds.map(r => r.model === 'haiku' ? 'Haiku' : 'Sonnet');
+  const toggleBar = document.createElement('div');
+  toggleBar.className = 'council-debate-toggle';
+  toggleBar.innerHTML = `<span>Council Debate (` + roundSummary.join(' + ') + `) — $` + council.total_cost.toFixed(6) + `</span><span id="council-arrow">&#9660;</span>`;
+
+  const body = document.createElement('div');
+  body.className = 'council-debate-body';
+
+  const emojiMap = {{ pragmatist: '🔧', critic: '🔍', synthesizer: '🧬' }};
+
+  for (const rnd of council.council_rounds) {{
+    const persona = document.createElement('div');
+    persona.className = 'council-persona';
+
+    const header = document.createElement('div');
+    header.className = 'council-persona-header';
+    const emoji = emojiMap[rnd.persona] || '';
+    const totalTok = rnd.input_tokens + rnd.output_tokens;
+    header.innerHTML = `${{emoji}} ${{rnd.persona.charAt(0).toUpperCase() + rnd.persona.slice(1)}} <span class="model-badge ${{rnd.model}}">${{rnd.model.charAt(0).toUpperCase() + rnd.model.slice(1)}}</span> <span style="color:#666;font-weight:normal">${{totalTok}} tok, $${{rnd.cost.toFixed(4)}}</span>`;
+
+    const text = document.createElement('div');
+    text.className = 'council-persona-text';
+    text.textContent = rnd.reply;
+
+    persona.appendChild(header);
+    persona.appendChild(text);
+    body.appendChild(persona);
+  }}
+
+  toggleBar.onclick = () => {{
+    body.classList.toggle('open');
+  }};
+
+  debate.appendChild(toggleBar);
+  debate.appendChild(body);
+  div.appendChild(debate);
+
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
 }}
 
 // --- PDF upload via pdf.js CDN ---
@@ -1040,7 +1424,8 @@ async function sendPaneMessage(pane) {{
   const textarea = document.getElementById(pane + '-input');
   const sendBtn = document.getElementById(pane + '-send');
   const msgContainer = pane === 'opt' ? optMessages : baseMessages;
-  const endpoint = pane === 'opt' ? '/api/chat/optimized' : '/api/chat/baseline';
+  const useCouncil = pane === 'opt' && councilMode;
+  const endpoint = useCouncil ? '/api/chat/council' : (pane === 'opt' ? '/api/chat/optimized' : '/api/chat/baseline');
   const dataKey = pane === 'opt' ? 'optimized' : 'baseline';
 
   const msg = textarea.value.trim();
@@ -1068,15 +1453,22 @@ async function sendPaneMessage(pane) {{
       return;
     }}
 
-    const result = data[dataKey];
-    const tok = result.input_tokens + result.output_tokens;
-    addMsg(msgContainer, 'assistant', result.reply, tok);
+    if (useCouncil && data.council) {{
+      // Show council debate UI
+      addCouncilMsg(msgContainer, data);
+    }} else {{
+      const result = data[dataKey];
+      const tok = result.input_tokens + result.output_tokens;
+      const cost = calcCost(result.input_tokens, result.output_tokens);
+      addMsg(msgContainer, 'assistant', result.reply, tok, cost);
+    }}
 
     // Update pipeline viz for this pane
-    if (pane === 'opt') {{
-      updateOptPipeline(result.pipeline);
-    }} else {{
-      updateBasePipeline(result.pipeline);
+    const optResult = data[dataKey] || data.optimized;
+    if (pane === 'opt' && optResult && optResult.pipeline) {{
+      updateOptPipeline(optResult.pipeline);
+    }} else if (pane === 'base') {{
+      updateBasePipeline(data.baseline.pipeline);
     }}
 
     // Update metrics from cumulative stats
@@ -1203,9 +1595,11 @@ async function sendSharedMessage(msg) {{
 
   const optTok = data.optimized.input_tokens + data.optimized.output_tokens;
   const baseTok = data.baseline.input_tokens + data.baseline.output_tokens;
+  const optCost = calcCost(data.optimized.input_tokens, data.optimized.output_tokens);
+  const baseCost = calcCost(data.baseline.input_tokens, data.baseline.output_tokens);
 
-  addMsg(optMessages, 'assistant', data.optimized.reply, optTok);
-  addMsg(baseMessages, 'assistant', data.baseline.reply, baseTok);
+  addMsg(optMessages, 'assistant', data.optimized.reply, optTok, optCost);
+  addMsg(baseMessages, 'assistant', data.baseline.reply, baseTok, baseCost);
 
   // Update pipelines
   updateOptPipeline(data.optimized.pipeline);
@@ -1695,7 +2089,7 @@ class ComparisonHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif self.path in ("/api/chat/optimized", "/api/chat/baseline"):
+        elif self.path in ("/api/chat/optimized", "/api/chat/baseline", "/api/chat/council"):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             message = body.get("message", "").strip()
@@ -1708,6 +2102,8 @@ class ComparisonHandler(BaseHTTPRequestHandler):
             try:
                 if self.path == "/api/chat/optimized":
                     result = _handle_solo_optimized(message)
+                elif self.path == "/api/chat/council":
+                    result = _handle_council(message)
                 else:
                     result = _handle_solo_baseline(message)
                 self._send_json(result)

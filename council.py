@@ -217,3 +217,128 @@ class CouncilEngine:
 
 # Shared engine instance
 council_engine = CouncilEngine()
+
+
+# ---------------------------------------------------------------------------
+# Live API Council — 3 sequential persona calls for comparison UI
+# ---------------------------------------------------------------------------
+
+# Per-model pricing
+_MODEL_PRICING = {
+    "claude-haiku-4-5-20251001": {
+        "cost_per_input": 1.0 / 1_000_000,   # $1 per 1M input
+        "cost_per_output": 5.0 / 1_000_000,   # $5 per 1M output
+    },
+    "claude-sonnet-4-20250514": {
+        "cost_per_input": 3.0 / 1_000_000,    # $3 per 1M input
+        "cost_per_output": 15.0 / 1_000_000,   # $15 per 1M output
+    },
+}
+
+_COUNCIL_PERSONAS = [
+    {
+        "id": "pragmatist",
+        "model": "claude-haiku-4-5-20251001",
+        "model_label": "haiku",
+        "system": (
+            "You are The Pragmatist. Focus on practical, actionable solutions. "
+            "Prioritize feasibility, cost, and time-to-deliver. Be concise and direct."
+        ),
+    },
+    {
+        "id": "critic",
+        "model": "claude-haiku-4-5-20251001",
+        "model_label": "haiku",
+        "system": (
+            "You are The Critic. Find flaws, edge cases, and risks in the previous analysis. "
+            "Play devil's advocate. Stress-test ideas. Point out what could go wrong. Be concise."
+        ),
+    },
+    {
+        "id": "synthesizer",
+        "model": "claude-sonnet-4-20250514",
+        "model_label": "sonnet",
+        "system": (
+            "You are The Synthesizer. You have read the Pragmatist's practical analysis "
+            "and the Critic's objections. Combine the strongest points into a single, "
+            "unified, actionable answer. Resolve disagreements. Be thorough but concise."
+        ),
+    },
+]
+
+
+def run_live_council(client, message: str, history: list[dict] | None = None) -> dict:
+    """
+    Run a live 3-persona council via the Claude API.
+
+    Each persona is called sequentially — later personas see earlier responses.
+    Returns structured result with per-persona breakdowns and cost.
+    """
+    if history is None:
+        history = []
+
+    council_rounds = []
+    accumulated_context = ""
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+
+    for persona in _COUNCIL_PERSONAS:
+        # Build messages for this persona
+        messages = list(history)  # copy conversation history
+
+        # Compose user content: original prompt + prior persona outputs
+        user_content = message
+        if accumulated_context:
+            user_content = (
+                f"{message}\n\n"
+                f"--- Prior council analysis ---\n{accumulated_context}"
+            )
+
+        messages.append({"role": "user", "content": user_content})
+
+        response = client.messages.create(
+            model=persona["model"],
+            max_tokens=1024,
+            system=[{
+                "type": "text",
+                "text": persona["system"],
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=messages,
+        )
+
+        reply = response.content[0].text
+        usage = response.usage
+        inp_tok = usage.input_tokens
+        out_tok = usage.output_tokens
+
+        # Cost for this persona's model
+        pricing = _MODEL_PRICING.get(persona["model"], _MODEL_PRICING["claude-sonnet-4-20250514"])
+        call_cost = inp_tok * pricing["cost_per_input"] + out_tok * pricing["cost_per_output"]
+
+        council_rounds.append({
+            "persona": persona["id"],
+            "model": persona["model_label"],
+            "reply": reply,
+            "input_tokens": inp_tok,
+            "output_tokens": out_tok,
+            "cost": round(call_cost, 8),
+        })
+
+        total_input += inp_tok
+        total_output += out_tok
+        total_cost += call_cost
+
+        # Accumulate context for next persona
+        name = PERSONAS[persona["id"]]["name"]
+        emoji = PERSONAS[persona["id"]]["emoji"]
+        accumulated_context += f"\n{emoji} {name}:\n{reply}\n"
+
+    return {
+        "final_reply": council_rounds[-1]["reply"],  # Synthesizer's output
+        "council_rounds": council_rounds,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_cost": round(total_cost, 8),
+    }

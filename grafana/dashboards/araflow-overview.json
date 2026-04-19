@@ -55,13 +55,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(araflow_tokens_prompt_tokens_total[1m])",
+          "expr": "rate(araflow_tokens_prompt_total[1m])",
           "legendFormat": "Prompt",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(araflow_tokens_completion_tokens_total[1m])",
+          "expr": "rate(araflow_tokens_completion_total[1m])",
           "legendFormat": "Completion",
           "refId": "B"
         }
@@ -96,7 +96,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_saved_tokens_total",
+          "expr": "araflow_tokens_saved_total",
           "legendFormat": "Saved",
           "refId": "A"
         }
@@ -124,19 +124,19 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_prompt_tokens_total",
+          "expr": "araflow_tokens_prompt_total",
           "legendFormat": "Prompt",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_completion_tokens_total",
+          "expr": "araflow_tokens_completion_total",
           "legendFormat": "Completion",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_saved_tokens_total",
+          "expr": "araflow_tokens_saved_total",
           "legendFormat": "Saved",
           "refId": "C"
         }
@@ -171,7 +171,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_prompt_tokens_total + araflow_tokens_completion_tokens_total",
+          "expr": "araflow_tokens_prompt_total + araflow_tokens_completion_total",
           "legendFormat": "Total Consumed",
           "refId": "A"
         }
@@ -206,7 +206,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tool_calls_calls_total",
+          "expr": "araflow_tool_calls_total",
           "legendFormat": "Tool Calls",
           "refId": "A"
         }
@@ -254,7 +254,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_context_active_tokens_current_tokens",
+          "expr": "araflow_context_active_tokens_current",
           "legendFormat": "Active Tokens",
           "refId": "A"
         }
@@ -288,7 +288,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_context_summary_nodes_current_nodes",
+          "expr": "araflow_context_summary_nodes_current",
           "legendFormat": "Summary Nodes",
           "refId": "A"
         }
@@ -325,7 +325,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_context_tokens_saved_total_tokens / (araflow_context_tokens_saved_total_tokens + araflow_context_active_tokens_current_tokens) * 100",
+          "expr": "clamp_min(araflow_context_tokens_saved_total, 0) / clamp_min(araflow_context_tokens_saved_total + araflow_context_active_tokens_current, 1) * 100",
           "legendFormat": "Efficiency %",
           "refId": "A"
         }
@@ -371,7 +371,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (le) (rate(araflow_tool_duration_ms_bucket[5m]))",
+          "expr": "sum by (le) (rate(araflow_tool_duration_milliseconds_bucket[5m]))",
           "format": "heatmap",
           "legendFormat": "{{le}}",
           "refId": "A"
@@ -405,7 +405,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "increase(araflow_tool_calls_calls_total{tool_name!=\"\"}[1m])",
+          "expr": "increase(araflow_tool_calls_total{tool_name!=\"\"}[1m])",
           "legendFormat": "{{tool_name}}",
           "refId": "A"
         }
@@ -447,7 +447,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.95, sum by (le, tool_name) (rate(araflow_tool_duration_ms_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, tool_name) (rate(araflow_tool_duration_milliseconds_bucket[5m])))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -547,13 +547,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(araflow_tokens_prompt_tokens_total{mode=\"optimized\"}[1m])",
+          "expr": "rate(araflow_tokens_prompt_total{mode=\"optimized\"}[1m])",
           "legendFormat": "Optimized",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(araflow_tokens_prompt_tokens_total{mode=\"baseline\"}[1m])",
+          "expr": "rate(araflow_tokens_prompt_total{mode=\"baseline\"}[1m])",
           "legendFormat": "Baseline",
           "refId": "B"
         }
@@ -588,7 +588,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "araflow_tokens_prompt_tokens_total{mode=\"baseline\"} - araflow_tokens_prompt_tokens_total{mode=\"optimized\"}",
+          "expr": "araflow_tokens_prompt_total{mode=\"baseline\"} - araflow_tokens_prompt_total{mode=\"optimized\"}",
           "legendFormat": "Tokens Saved",
           "refId": "A"
         }
@@ -628,7 +628,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "(araflow_tokens_prompt_tokens_total{mode=\"baseline\"} - araflow_tokens_prompt_tokens_total{mode=\"optimized\"}) / araflow_tokens_prompt_tokens_total{mode=\"baseline\"} * 100",
+          "expr": "(araflow_tokens_prompt_total{mode=\"baseline\"} - araflow_tokens_prompt_total{mode=\"optimized\"}) / araflow_tokens_prompt_total{mode=\"baseline\"} * 100",
           "legendFormat": "Savings %",
           "refId": "A"
         }

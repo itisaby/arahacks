@@ -14,15 +14,57 @@ AraFlow is a daily-life AI assistant that **gets smarter about itself**. It mana
 
 ## Architecture
 
-```
-User ↔ Ara SDK (cloud runtime)
-         ↓
-   ┌─────────────────┐
-   │   app.py         │  ← Automation + 10 traced tools
-   │   ├─ telemetry   │  ← OTel spans + token accounting
-   │   ├─ summarizer  │  ← Recursive context compression
-   │   └─ dashboard   │  ← Live visualization
-   └─────────────────┘
+```mermaid
+graph TD
+    User([fa:fa-user User])
+
+    subgraph Browser["Browser — Comparison UI"]
+        Optimized["Optimized Pane<br/><i>compressed context</i>"]
+        Baseline["Baseline Pane<br/><i>raw context</i>"]
+        Council["Council Mode<br/><i>3-persona pipeline</i>"]
+    end
+
+    subgraph Backend["Python Backend"]
+        CompPy["comparison.py<br/><i>dual-pane server</i>"]
+        CouncilPy["council.py<br/><i>Pragmatist → Critic → Synthesizer</i>"]
+        Summarizer["recursive_summarizer.py<br/><i>L0 → L1 → L2 compression</i>"]
+        Telemetry["telemetry.py<br/><i>OTel spans + metrics</i>"]
+        WebSearch["web_search tool<br/><i>DuckDuckGo API</i>"]
+    end
+
+    subgraph External["External Services"]
+        Claude["Claude API<br/><i>Anthropic</i>"]
+        DDG["DuckDuckGo<br/><i>Instant Answer API</i>"]
+    end
+
+    subgraph Observability["Observability Stack"]
+        OTEL["OTel Collector"]
+        Prometheus["Prometheus"]
+        Tempo["Tempo"]
+        Grafana["Grafana Dashboards"]
+    end
+
+    User --> Browser
+    Optimized --> CompPy
+    Baseline --> CompPy
+    Council --> CouncilPy
+    CompPy --> Summarizer
+    CompPy --> Claude
+    CompPy --> WebSearch
+    CouncilPy --> Claude
+    WebSearch --> DDG
+    CompPy --> Telemetry
+    CouncilPy --> Telemetry
+    Telemetry --> OTEL
+    OTEL --> Prometheus
+    OTEL --> Tempo
+    Prometheus --> Grafana
+    Tempo --> Grafana
+
+    style Browser fill:#e8f4fd,stroke:#2196F3
+    style Backend fill:#e8f5e9,stroke:#4CAF50
+    style External fill:#fff3e0,stroke:#FF9800
+    style Observability fill:#fce4ec,stroke:#E91E63
 ```
 
 ## Quick Start
