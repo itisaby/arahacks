@@ -14,6 +14,7 @@ import time
 import threading
 import urllib.request
 import urllib.parse
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,8 +37,19 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 # GitHub API tools (direct REST API via GH_TOKEN)
 # ---------------------------------------------------------------------------
 
+_gh_api_calls: list[float] = []  # timestamps for rate limiting
+GH_RATE_LIMIT = 30  # max GitHub API calls per minute
+
+
 def _gh_api(endpoint: str) -> dict | list:
-    """Call GitHub REST API. Returns parsed JSON."""
+    """Call GitHub REST API. Returns parsed JSON. Sanitizes errors to prevent token leakage."""
+    # Rate limiting
+    now = time.time()
+    _gh_api_calls[:] = [t for t in _gh_api_calls if now - t < 60]
+    if len(_gh_api_calls) >= GH_RATE_LIMIT:
+        raise RuntimeError(f"GitHub API rate limit reached ({GH_RATE_LIMIT}/min). Try again shortly.")
+    _gh_api_calls.append(now)
+
     url = "https://api.github.com" + endpoint
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {GH_TOKEN}",
@@ -45,8 +57,14 @@ def _gh_api(endpoint: str) -> dict | list:
         "User-Agent": "AraFlow/1.0",
         "X-GitHub-Api-Version": "2022-11-28",
     })
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # Sanitize — never expose headers or token in error messages
+        raise RuntimeError(f"GitHub API error: {e.code} {e.reason} for {endpoint}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"GitHub API connection error for {endpoint}") from None
 
 
 @traced_tool
@@ -2212,8 +2230,8 @@ class ComparisonHandler(BaseHTTPRequestHandler):
 
 
 def start_comparison_server(port=8060):
-    """Start the comparison UI server (blocking)."""
-    server = HTTPServer(("", port), ComparisonHandler)
+    """Start the comparison UI server (blocking). Binds to localhost only."""
+    server = HTTPServer(("127.0.0.1", port), ComparisonHandler)
     print(f"Comparison UI running on http://localhost:{port}")
     server.serve_forever()
 

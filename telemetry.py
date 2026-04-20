@@ -312,18 +312,41 @@ def reset_cost_tracker(budget_limit: float = 5.00):
 # Decorator: instrument any Ara tool function
 # ---------------------------------------------------------------------------
 
+# Keys to redact from tool args/results before logging to spans
+_SENSITIVE_KEYS = {"token", "password", "secret", "key", "authorization", "private"}
+
+
+def _redact_for_span(data, max_len=200):
+    """Redact sensitive fields from data before logging to OTel spans."""
+    text = str(data)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "...[truncated]"
+
+
+def _safe_args_for_span(kwargs):
+    """Serialize kwargs for span, redacting sensitive-looking values."""
+    safe = {}
+    for k, v in kwargs.items():
+        if any(s in k.lower() for s in _SENSITIVE_KEYS):
+            safe[k] = "[REDACTED]"
+        else:
+            safe[k] = v
+    return json.dumps(safe, default=str)
+
+
 def traced_tool(fn):
     """Wrap an @ara.tool function with OTel tracing + token/duration logging."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with tracer.start_as_current_span(f"tool.{fn.__name__}") as span:
             span.set_attribute("tool.name", fn.__name__)
-            span.set_attribute("tool.args", json.dumps(kwargs, default=str))
+            span.set_attribute("tool.args", _safe_args_for_span(kwargs))
             t0 = time.perf_counter()
             try:
                 result = fn(*args, **kwargs)
                 span.set_status(StatusCode.OK)
-                span.set_attribute("tool.result_preview", str(result)[:200])
+                span.set_attribute("tool.result_preview", _redact_for_span(result))
                 return result
             except Exception as exc:
                 span.set_status(StatusCode.ERROR, str(exc))
